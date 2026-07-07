@@ -16,8 +16,8 @@ setup(
     zip_safe=True,
     maintainer='aaronreycast',
     maintainer_email='aaronreycast@gmail.com',
-    description='TODO: Package description',
-    license='TODO: License declaration',
+    description='2D surface-vessel (ASV) localization in a tank from wall-mounted AprilTags.',
+    license='Apache-2.0',
     extras_require={
         'test': [
             'pytest',
