@@ -13,6 +13,11 @@ from geometry_msgs.msg import Pose2D # simple X,Y,theta message
 
 
 def object_points(size):
+    """Return the 4 tag corners in the tag's own frame (meters), for solvePnP.
+
+    Points are centered at the tag origin with half-edge h = size/2, in the
+    TL,TR,BR,BL order that cv2.SOLVEPNP_IPPE_SQUARE requires.
+    """
     h = size / 2.0
     # cv2.SOLVEPNP_IPPE_SQUARE requires this EXACT order (OpenCV convention, +Y up):
     # TL, TR, BR, BL. The image points are reordered to match (see tag_pose_in_camera).
@@ -85,15 +90,18 @@ class VesselLocalizer(Node):
         self.get_logger().info("vessel_localizer node initialized")
     
     def on_camera_info(self, msg: CameraInfo):
+        """Cache the latest camera intrinsics: K (3x3) and distortion D."""
         # K = [fx 0 cx; 0 fy cy; 0 0 1]
         self.K = np.array(msg.k, dtype=np.float64).reshape(3,3)
         # D = [k1, k2, p1, p2, k3]
         self.D = np.array(msg.d, dtype=np.float64)
     
-    # Pending to create on_tags, load_tag_map, make_camera_mount function
-    
     def load_tag_map(self, path):
-        """ """
+        """Load the tag map YAML into {id: (T_W_T 4x4, size)}.
+
+        Each entry's (x, y, z, theta_deg) is turned into the tag's world pose via
+        tag_world_T; the tag size falls back to the file's default_tag_size (0.135 m).
+        """
         with open(path, 'r') as f:
             data = yaml.safe_load(f)
         default_size = data.get('default_tag_size', 0.135)
@@ -125,6 +133,12 @@ class VesselLocalizer(Node):
         return make_T(R_B_C, t_B_C)
     
     def tag_pose_in_camera(self, det):
+        """Estimate one tag's pose in the camera frame from its detected corners.
+
+        Runs cv2.solvePnP (IPPE_SQUARE) on the tag's object points and the message
+        corners reversed to TL,TR,BR,BL. Returns the 4x4 transform T_C_T, or None if
+        solvePnP fails.
+        """
         size = self.tag_map[det.id][1]
         obj = object_points(size)
         # message corners are BL,BR,TR,TL; reverse to TL,TR,BR,BL to match object_points
@@ -149,6 +163,17 @@ class VesselLocalizer(Node):
         return T_C_T # tag expressed in camera frame (4x4 homogeneous transform)
     
     def on_tags(self, msg: AprilTagDetectionArray):
+        """Subscription callback for /tags: turn detected tags into a vessel pose.
+
+        For each detection, run the transform chain
+        T_W_B = T_W_T @ inv(T_C_T) @ inv(T_B_C) to get one (x, y, yaw) estimate of
+        the vessel in the world, skipping unknown IDs and weak detections
+        (decision_margin < 30). The estimates are fused (weighted by decision_margin)
+        into a single Pose2D published on /vessel_pose. When >=2 tags are visible,
+        each tag's independent estimate and the fused result are logged at 1 Hz so
+        their agreement can be checked. Returns early without publishing if intrinsics
+        have not arrived yet or if no tag produced a valid estimate.
+        """
         if self.K is None:
             return # no intrinsics yet
         estimates = []
@@ -200,7 +225,11 @@ class VesselLocalizer(Node):
         self.pub.publish(out)
         
     def fuse(self, estimates, weights):
-        """Robust fusion when several tags are detected simultaneously"""
+        """Combine several (x, y, yaw) estimates into one, weighted by `weights`.
+
+        x and y are weighted averages; yaw is averaged via unit vectors so the
+        +/-180 deg wrap is handled correctly. Returns the fused (x, y, yaw).
+        """
         w = np.array(weights, dtype=np.float64)
         w /= w.sum()
         xs = np.array([e[0] for e in estimates])

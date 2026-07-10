@@ -107,14 +107,18 @@ estimate and the fused result (throttled to 1 Hz) for validation.
 The node is validated end-to-end (single tag, and multi-tag fusion with a coplanar pair).
 See [`docs/PHASE3_LOCALIZATION_RESULTS.md`](docs/PHASE3_LOCALIZATION_RESULTS.md) for the full log.
 
-Two calibration items are still pending and currently bias the absolute pose:
+The former **~+7.2% range-scale error is fixed.** The 480p intrinsics were rescaled via a
+physical range test (`fx → 424.29`, `fy → 424.67`, `cx/cy`/distortion kept), which is the
+source of truth for this wide/distorted lens rather than the unstable checkerboard fit. A
+3-distance re-probe (0.50→0.510, 1.00→1.014, 1.50→1.511) refits to **slope 1.001** (was 1.072);
+the residual is a benign ~1 cm constant offset (lens-surface-to-pinhole reference). Ranges are
+now metric.
 
-- **Range scale ~+7.2%** — the 480p intrinsics read distances ~7% long (`fx` slightly high).
-  Fix is a camera **recalibration** at 480p; the localization math itself is correct. Until
-  then, treat published ranges as ~7% long.
+One calibration item still biases the absolute pose:
+
 - **Camera mount `t_B_C`** — in `make_camera_mount()`, `z = 0.5` m is measured but the forward
-  (`x`) and lateral (`y`) offsets are placeholders and directly bias the published X/Y. Measure
-  them on the real boat and update.
+  (`x`) and lateral (`y`) offsets are still placeholders (`[0.20, 0.0]`) and directly bias the
+  published X/Y. Measure them on the real boat and update.
 
 An implementation note worth flagging: `cv2.SOLVEPNP_IPPE_SQUARE` requires object/image points
 in `TL, TR, BR, BL` order, whereas the `/tags` message delivers corners as `BL, BR, TR, TL` —
