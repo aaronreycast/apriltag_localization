@@ -44,13 +44,14 @@ Tank top-view: origin at the top-left corner, **X points down, Y points right, Z
 |---|-------|------|
 | **Subscribes** | `/tags` | `apriltag_msgs/AprilTagDetectionArray` |
 | **Subscribes** | `/camera/camera_info` | `sensor_msgs/CameraInfo` |
-| **Publishes** | `/vessel_pose` | `geometry_msgs/Pose2D` (`x`, `y` in metres; `theta` in **radians**) |
+| **Publishes** | `/vessel_pose` | `geometry_msgs/PoseStamped` — full 6-DoF: `pose.position` (x, y, z in metres) + `pose.orientation` (unit quaternion). `header.stamp` is the **image-acquisition time** (copied from `/tags`, not publish time); `header.frame_id` is the `frame_id` parameter. |
 
 **Parameters**
 
 | Name | Default | Description |
 |------|---------|-------------|
 | `tag_map_path` | `config/tag_map.yaml` (via launch) | Absolute path to the tag-map YAML |
+| `frame_id` | `map` | World frame stamped into `header.frame_id` of the published pose. **Must match what the downstream EKF expects** — a mismatch corrupts fusion silently. |
 
 ## Tag map format
 

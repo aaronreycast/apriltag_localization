@@ -3,7 +3,7 @@
 <package format="3">
   <name>apriltag_localization</name>
   <version>0.0.0</version>
-  <description>2D surface-vessel (ASV) localization in a tank from wall-mounted AprilTags: solvePnP per tag, transform chain through a known tag map, decision_margin-weighted multi-tag fusion, publishes vessel Pose2D.</description>
+  <description>6-DoF surface-vessel (ASV) localization in a tank from wall-mounted AprilTags: solvePnP per tag, transform chain through a known tag map, decision_margin-weighted multi-tag fusion (Markley quaternion averaging for rotation), publishes vessel PoseStamped.</description>
   <maintainer email="aaronreycast@gmail.com">aaronreycast</maintainer>
   <license>Apache-2.0</license>
 

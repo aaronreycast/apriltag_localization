@@ -2,8 +2,10 @@
 
 1. Deliverable built: `apriltag_localization` (ament_python) package with node `vessel_localizer`
    (`localizer_node.py`). Subscribes `/tags` (AprilTagDetectionArray) + `/camera/camera_info`,
-   runs OpenCV solvePnP per detected tag, and publishes the vessel pose on `/vessel_pose`
-   (`geometry_msgs/Pose2D`: x, y in metres, theta in RADIANS).
+   runs OpenCV solvePnP per detected tag, and publishes the vessel pose on `/vessel_pose`.
+   (Originally `geometry_msgs/Pose2D`: x, y in metres, theta in RADIANS. **Superseded
+   2026-07-21 by Open Item #3** — now `geometry_msgs/PoseStamped`, full 6-DoF with header;
+   the 2D results below remain valid for the x/y/yaw components.)
 
 2. Transform chain (world <- tag <- camera <- boat): T_W_B = T_W_T · inv(T_C_T) · inv(T_B_C).
    - T_C_T  : tag pose in camera frame, from solvePnP (corners + tag size + intrinsics).
