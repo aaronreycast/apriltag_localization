@@ -39,7 +39,8 @@
      install) -> gscam fell back to 1080p intrinsics for 480p images. Rebuilt apriltag_detector.
    - clean Ctrl-C shutdown (guarded double rclpy.shutdown()); resolution arg must be "480p".
 
-8. RANGE-SCALE FINDING (the one pending fix): raw solvePnP range reads ~7.2% long.
+8. RANGE-SCALE FINDING  [RESOLVED 2026-07-09 — see closing note below]: raw solvePnP range
+   reads ~7.2% long.
    tvec_Z vs tape-measured distance, tag head-on:
 
    tape (m)   tvec_Z (m)   Z - tape    Z / tape
@@ -58,12 +59,29 @@
 9. Decision: keep running at 480p (per Phase 2). Node is production-ready pending the recal;
    until then, treat published ranges as ~7% long.
 
+   CLOSING NOTE (2026-07-09): finding 8 was correct and the fix landed. The 480p fx/fy were
+   metric-rescaled to 424.29 / 424.67 (cx/cy and distortion kept) and re-verified with the
+   same 3-distance probe: slope 1.072 -> 1.001, intercept +0.011 m (a benign lens-surface-to-
+   pinhole reference offset, not a scale term). Published 480p ranges are no longer long.
+   Note the diagnosis in item 8 above understated one thing: the checkerboard solver was not
+   merely "imprecise", it trades focal length against distortion, and low reprojection error
+   does not constrain that trade at all. A physical range test is the source of truth for
+   fx/fy on this lens -- now written up as CAMERA_CALIBRATION.md section 5c.
+
 Still open before Phase 3 is fully closed:
-- Recalibrate the 480p intrinsics (removes the 7.2% range scale error). Guide:
-  apriltag_detector/docs/CAMERA_CALIBRATION.md.
+- [DONE 2026-07-09] Recalibrate the 480p intrinsics (removed the 7.2% range scale error).
 - Measure the real camera mount t_B_C (forward x, lateral y) on the boat and update
   make_camera_mount() — currently z=0.5 measured, x/y are placeholders that bias X/Y.
-- (Optional) re-check whether 720p / 1080p share the same scale error.
+  This is now the LARGEST unquantified term in the pose budget: a 0.20 m placeholder against
+  a ~0.5% (~20 mm at 5 m) residual calibration error.
+- [ANSWERED 2026-07-28] "re-check whether 720p / 1080p share the same scale error" — YES.
+  1080p read +7.9% long, the same disease from the same cause; fixed by metric rescale to
+  fx 948.36 / fy 946.28, verified slope 1.005 (per-station error 8.8/8.1/8.0/8.2/7.9% ->
+  0.4/0.2/0.33/0.45/0.44%). 720p was measured the same day and erred in the OPPOSITE
+  direction -- 2.5% SHORT -- rescaled to fx 632.88 / fy 631.77, verified slope 1.0002
+  (per-station error -2.6/-2.3/-2.5/-2.4/-2.6% -> +1.0/+0.4/+0.27/+0.35/+0.16%). All three
+  resolutions are now metric-verified. Cross-check: 720p fx * 1.5 = 949.32 vs 1080p's
+  independently measured 948.36 (0.10% apart), confirming 720p is a true 2/3 downscale.
 
 10. MULTI-TAG FUSION VALIDATED (2026-07-07, live, 480p): two coplanar tags on the left wall,
     tag 1 (2.5,0) + tag 3 (5.0,0), camera hand-held at the midpoint 2.45 m normal to the wall.

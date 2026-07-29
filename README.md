@@ -115,7 +115,16 @@ source of truth for this wide/distorted lens rather than the unstable checkerboa
 the residual is a benign ~1 cm constant offset (lens-surface-to-pinhole reference). Ranges are
 now metric.
 
-One calibration item still biases the absolute pose:
+**1080p had the same disease and was fixed the same way (2026-07-28):** +7.9% long, rescaled to
+`fx → 948.36`, `fy → 946.28`, verified over five stations at **slope 1.005** (per-station error
+8.8/8.1/8.0/8.2/7.9% → 0.4/0.2/0.33/0.45/0.44%). **720p was measured the same day and erred in
+the opposite direction — 2.5% short** — rescaled to `fx → 632.88`, `fy → 631.77`, verified at
+**slope 1.0002**. **All three resolutions are now metric-verified.** As a cross-check the two
+16:9 modes independently agree: 720p's fx × 1.5 = 949.32 vs 1080p's measured 948.36 (0.10%).
+Procedure: `apriltag_detector/docs/CAMERA_CALIBRATION.md` §5c.
+
+One calibration item still biases the absolute pose — and it is now **the dominant term**, an
+unmeasured 0.20 m against a ~0.5% (≈20 mm at 5 m) residual calibration error:
 
 - **Camera mount `t_B_C`** — in `make_camera_mount()`, `z = 0.5` m is measured but the forward
   (`x`) and lateral (`y`) offsets are still placeholders (`[0.20, 0.0]`) and directly bias the
