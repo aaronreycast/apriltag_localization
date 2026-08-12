@@ -8,8 +8,10 @@ tags:
 # TAG 0
   0:
     x: 0.0
-    y: 2.45
-    z: 0.5 # height of tag center from water surface level
+    y: 2.5
+    # measured 07/17/26 by tape
+    # top of the laminated A4 sheet aligned with the wall top, 0.36 m above still water; sheet top to black-square centre 0.1185 m; centre therefore 0.2415 m
+    z: 0.2415 # height of tag center from water surface level (initially 0.5m, fixed at 0.2415m for final version)
     theta_deg: 0.0 # face normal points toward world +X
     # size: 0.135 # optional, overrides default_tag_size
 
@@ -17,15 +19,15 @@ tags:
   1:
     x: 2.5
     y: 0.0
-    z: 0.5
+    z: 0.2415
     theta_deg: 90.0 # face normal points toward world +Y
     # size: 0.135 # optional, overrides default_tag_size
 
 # TAG 2
   2:
     x: 2.5
-    y: 4.9
-    z: 0.5
+    y: 5.0
+    z: 0.2415
     theta_deg: -90.0 # face normal points toward world -Y
     # size: 0.135 # optional, overrides default_tag_size
 
@@ -33,15 +35,15 @@ tags:
   3:
     x: 5.0
     y: 0.0
-    z: 0.5
+    z: 0.2415
     theta_deg: 90.0
     # size: 0.135 # optional, overrides default_tag_size
 
 # TAG 4
   4:
     x: 5.0
-    y: 4.9
-    z: 0.5
+    y: 5.0
+    z: 0.2415
     theta_deg: -90.0
     # size: 0.135 # optional, overrides default_tag_size
 
@@ -49,15 +51,15 @@ tags:
   5:
     x: 7.5
     y: 0.0
-    z: 0.5
+    z: 0.2415
     theta_deg: 90.0
     # size: 0.135 # optional, overrides default_tag_size
 
 # TAG 6
   6:
     x: 7.5
-    y: 4.9
-    z: 0.5
+    y: 5.0
+    z: 0.2415
     theta_deg: -90.0
     # size: 0.135 # optional, overrides default_tag_size
     
@@ -65,15 +67,15 @@ tags:
   7:
     x: 10.0
     y: 0.0
-    z: 0.5
+    z: 0.2415
     theta_deg: 90.0
     # size: 0.135 # optional, overrides default_tag_size
 
 # TAG 8
   8:
     x: 10.0
-    y: 4.9
-    z: 0.5
+    y: 5.0
+    z: 0.2415
     theta_deg: -90.0
     # size: 0.135 # optional, overrides default_tag_size
 
@@ -81,14 +83,14 @@ tags:
   9:
     x: 12.5
     y: 0.0
-    z: 0.5
+    z: 0.2415
     theta_deg: 90.0
     # size: 0.135 # optional, overrides default_tag_size
 
 # TAG 10
   10:
     x: 12.5
-    y: 4.9
-    z: 0.5
+    y: 5.0
+    z: 0.2415
     theta_deg: -90.0
     # size: 0.135 # optional, overrides default_tag_size

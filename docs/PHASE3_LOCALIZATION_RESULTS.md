@@ -31,6 +31,11 @@
 6. Validation (tag 0, head-on): with correct intrinsics tvec Z tracks real distance; the full
    chain reproduces the expected vessel pose. Example at ~1 m: X ~ 1.2 m (range + 0.2 m mount),
    Y ~ 2.45 m, yaw ~ 180 deg (boat faces the wall tag — 180 deg is correct, not 0).
+   [MAP CORRECTION 2026-08-06] The 2.45 above is not an independent measurement — it is tag 0's
+   y from the map, echoed back by the localizer because the boat was head-on to tag 0. Tag 0 is
+   physically CENTRED between the side walls, so its y is tank_width/2; the width was then
+   assumed 4.9 m and has since been tape-measured at 5.0 m. Map updated to y=2.5, so this
+   validation now reads Y ~ 2.50 m. The 0.05 m shift is a map fix, not a pose-estimation change.
 
 7. Build/run gotchas resolved this phase:
    - setup.py listed launch/localize.launch.py in data_files but the file was missing -> colcon
@@ -108,3 +113,58 @@ Still open before Phase 3 is fully closed:
       visualise:=true; harmless to detection/localization. Drop the arg or view /image_tags raw.
 
 Launch used: ros2 launch apriltag_localization localize.launch.py
+
+---
+
+## 2026-08-05 — hardware validation of the 6-DoF output (720p, Jetson, exploreHD)
+
+11. STAMP ALIGNMENT VALIDATED (Open Item #3, first of three pending checks): concurrent 10 s
+    capture of `/tags` and `/vessel_pose` header stamps gave **7/7 `/vessel_pose` stamps present
+    exactly (to the nanosecond) in the `/tags` stamp set**. `out.header.stamp = msg.header.stamp`
+    (localizer_node.py) does carry image-acquisition time through to the published pose; it is
+    not `now()`, and it is not zero.
+
+    - METHOD TRAP: three sequential `ros2 topic echo --once` calls cannot test this. Each waits
+      for its OWN next message, so they sample different frames and equality is undefined. Both
+      topics must be captured concurrently and compared as sets:
+          stdbuf -oL ros2 topic echo --qos-profile sensor_data /tags --field header.stamp > a &
+          stdbuf -oL ros2 topic echo /vessel_pose --field header.stamp > b &
+          sleep 10; kill %1 %2
+
+12. FULL TRANSFORM CHAIN INDEPENDENTLY RE-DERIVED: the published pose was recomputed from
+    scratch out of the raw `/tags` corners -- solvePnP(IPPE_SQUARE) -> T_W_T @ inv(T_C_T) @
+    inv(T_B_C) -> Shepperd quaternion -> ZYX Euler -- using tag 0's map entry and the 720p K/D.
+
+        independent recompute : x=+2.8325  y=+2.6156  z=-0.4358  roll=-0.61  pitch=+1.65  yaw=-179.88
+        node's published pose : x=+2.8294  y=+2.6255  z=-0.4416  roll=-0.61  pitch=+1.54  yaw=-179.68
+
+    Agreement 3 mm / 10 mm / 6 mm and 0.1-0.2 deg, across two messages 2.6 s APART (i.e. different
+    frames), so the residual is frame-to-frame jitter, not a code discrepancy. The chain, the
+    quaternion conversion and the read-out are confirmed end-to-end on real hardware.
+
+    - BY-PRODUCT: single-tag static jitter is ~12 mm radial at 2.6 m range.
+    - yaw = -179.7 deg is correct for viewing tag 0, whose map normal points world +X.
+
+13. `/vessel_pose` RATE != `/tags` RATE -- and the project's headline throughput figure was
+    mislabelled. `DetectorComponent::callback` publishes an AprilTagDetectionArray on EVERY frame,
+    empty or not (detector_component.cpp:169). `on_tags` publishes only when at least one mapped
+    tag survives the `decision_margin < 30` and unknown-ID filters (localizer_node.py:302).
+
+        pose rate = detector throughput x detection fraction
+
+    Observed in one run: `/tags` 31.2 Hz, `/vessel_pose` 1.3 Hz -- 7 poses from 196 frames.
+    Any figure quoted as a "pose rate" must be measured on `/vessel_pose`.
+
+14. `decision_margin` DOES NOT MEASURE DETECTION HEALTH. Through a station detecting only 3.6% of
+    frames, margins stayed 165-215 -- i.e. when the tag decoded it decoded cleanly, it simply
+    usually was not found at all. The `decision_margin < 30` rejection in `on_tags` is therefore
+    blind to bad mounting, an inadequate quiet zone, or a tag too small to detect. It filters weak
+    decodes, not missing ones.
+
+15. STILL PENDING for Open Item #3: the tags 1+3 fusion rerun against the 2026-07-09 result
+    (3.905, 2.673, -90.63 deg), and the level-bench roll ~ pitch ~ 0 check.
+
+    - The rerun MUST use the UNCHANGED placeholder `t_B_C = [0.20, 0.0, 0.5]`. The 07-09 number
+      bakes it in: camera at (3.87, 2.5), expected base (3.87, 2.70), and R(-90 deg)*[0.20,0,0]
+      = [0,-0.20] is exactly that offset. Applying a measured mount before the regression moves
+      the target and lets a real regression hide inside the offset change.
