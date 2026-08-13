@@ -126,21 +126,29 @@ What is worth reading in it:
   x and 0.24 m in y**; restricted to the two-tag stretch after the handover, **0.80 m and
   0.16 m**. The y figure is the one to watch — before the two-pass fusion change it was
   **0.73 m** over that same stretch, a 4.6× difference on identical input.
-- **`frames with a fix: 48 %`** in the excerpt. Across the whole bag it is 46.2%: of 1069
+- **`frames with a fix: 48 %`** in the excerpt. Across the whole bag it is **32.4%**: of 1069
   camera frames the detector emitted `/tags` for 592 (55%) — this is the 1080p throughput
-  collapse that later drove the switch to 720p — and 83% of those decoded at least one mapped
-  tag, for 494 published poses. Frames where the overlay drops out while a tag is plainly
-  visible are detector misses, not localizer rejections.
+  collapse that later drove the switch to 720p — and of the detections in those frames, **205
+  were rejected by the ambiguity gate**, leaving 346 published poses. Without the gate it is
+  46.2% / 494 poses. So roughly **a third of the drop-outs you see are now deliberate**: frames
+  where the overlay shows a tag but no fix appear as `N detection(s) rejected - ambiguous pose`
+  rather than as detector misses, and the two are labelled separately on purpose.
 
-**This is a 5.6 s excerpt (t = 30.4–36.1), and the selection is not cosmetic.** It is the
-longest continuous stretch of the run that is free of **pose-ambiguity flips** — a real,
-open defect documented under [Open work](#open-work). Over the full 36 s, **20.5%** of published
-fixes land more than 0.5 m from their own local median, in bursts lasting a few tenths of a
-second. Showing them without explanation would misattribute a solvable PnP branch-selection
-bug to the localization concept; showing them silently smoothed would be worse. They are
-excluded here, quantified there, and **the uncut 36 s render is kept alongside this one** at
-[`docs/media/demo_full_uncut.mp4`](docs/media/demo_full_uncut.mp4) — the flip bursts are
-plainly visible in it at t ≈ 25.5 s and t ≈ 29 s.
+**This is a 5.6 s excerpt (t = 30.4–36.1).** It was originally chosen as the longest continuous
+stretch free of **pose-ambiguity flips**, which at the time was a real open defect: over the
+full 36 s, **20.3%** of published fixes landed more than 0.5 m from their own local median, in
+bursts lasting a few tenths of a second. **That defect was fixed on 2026-08-12** by a rejection
+gate on the IPPE solution ratio (see [Open work](#open-work)), which cut the full-run outlier
+rate to **6.6%** and took the number of flip-free stretches ≥2 s from 5 to 8, the longest from
+3.6 s to 7.3 s. The excerpt is **kept at the same window** so it reads as a direct before/after
+against the previously published clip, and it is no longer the only clean part of the run.
+
+**The uncut 36 s render is kept alongside it** at
+[`docs/media/demo_full_uncut.mp4`](docs/media/demo_full_uncut.mp4). The accumulating scatter in
+its map panel is the clearest single piece of evidence for the gate: rendered with
+`--min-pose-ratio 0.0` the cloud sprays a smeared tail across ~4 m of tank; at the 1.5 default
+it is a compact blob on the vessel. Both renders come from the same command with one flag
+changed, so the comparison can be reproduced rather than taken on trust.
 
 Two caveats stated on the frame itself: the bag is **1080p** (recorded before 720p became the
 operating resolution), and the intrinsics are the **corrected** `camera_1080p.yaml`. The
@@ -173,6 +181,7 @@ result does not predict and which no ground truth here can adjudicate.
 |------|---------|-------------|
 | `tag_map_path` | `config/tag_map.yaml` (via launch) | Absolute path to the tag-map YAML |
 | `frame_id` | `map` | World frame stamped into `header.frame_id` of the published pose. **Must match what the downstream EKF expects** — a mismatch corrupts fusion silently. Not exposed as a launch argument; override with `--ros-args -p frame_id:=...`. |
+| `min_pose_ratio` | `1.5` | Planar-ambiguity rejection gate: minimum `err[1]/err[0]` from `solvePnPGeneric` for a detection to be used. See [Open work](#open-work) for how 1.5 was chosen and what it costs. **`0.0` disables it.** Unlike the two above, this one is **settable at runtime** — `ros2 param set /vessel_localizer min_pose_ratio 1.2` — because it is the one value that can only honestly be tuned against real geometry, and on the water a relaunch costs a station. Changing it resets the gate tally. A negative value is rejected rather than clamped. |
 
 > **`/tags` rate is not the pose rate.** The detector publishes an `AprilTagDetectionArray`
 > on *every* frame, empty or not, so `pose rate = detector throughput × detection fraction`.
@@ -260,6 +269,8 @@ current operating resolution of **720p**. Full log:
 | **Multi-tag fusion, tags 1+3, after the two-pass fix** | **26 mm radial, 0.11° yaw** (fused `3.8767, 3.0948, −90.109°` vs truth `3.888, 3.118, −90.0°`), station known to ±5 mm | 2026-08-11 *(720p)* |
 | Static precision, 2 tags, 940 samples | x IQR 3.3 mm, **y IQR 0.7 mm**, z 4.1 mm, yaw 0.064°, **0 flips** | 2026-08-11 |
 | **Single** visible tag, same station | **~0.3 m radial** (308 mm tag 1, 331 mm tag 3) — see [Open work](#open-work) | 2026-08-11 |
+| **Ambiguity gate, on-water bag** (`min_pose_ratio` 1.5) | >0.5 m outliers **20.3% → 6.6%** for 30% of fixes; pose rate 13.8 → 10.1 Hz | 2026-08-12 |
+| Ambiguity gate on clean data | **inert — 0 of 3752** static-fixture detections gated at any threshold up to 2.0 | 2026-08-12 |
 
 **Ranges are metric at all three resolutions.** The original ~+7.2% range-scale error was a
 calibration fault, not a localization one: the checkerboard calibrator is unstable on this
@@ -279,7 +290,7 @@ apart. Procedure: `apriltag_detector/docs/CAMERA_CALIBRATION.md` §5c.
 
 ## Open work
 
-- **Planar pose ambiguity is not resolved — the largest source of bad single-tag fixes.**
+- **Planar pose ambiguity — GATED as of 2026-08-12, with a residual that a gate cannot reach.**
   A square tag viewed by a single camera admits **two** poses that both reproject nearly
   onto the observed corners, mirrored about the tag plane. `cv2.solvePnP` returns only one
   and gives no indication that the other was close. Re-solving this bag with
@@ -287,28 +298,71 @@ apart. Procedure: `apriltag_detector/docs/CAMERA_CALIBRATION.md` §5c.
   ratio of the two solutions' reprojection errors has a **median of 2.01**, with **33% below
   1.5**. When the solver takes the wrong branch the vessel pose jumps metres — at t = 28.90 s
   the two solutions sat at 0.394 px and 0.627 px error and the one returned put the boat at
-  (2.40, 0.96) instead of ≈ (5.9, 2.3). **20.5% of the published fixes in this run land more
+  (2.40, 0.96) instead of ≈ (5.9, 2.3). **20.3% of the published fixes in this run landed more
   than 0.5 m from their own local median** (18.5% before the 2026-08-11 fusion change — the
   two-pass fix targets a different failure mode and does not help here; measured, not assumed:
   the correlation between a frame's IPPE error ratio and how much the fusion change moved it
   is **−0.065**, i.e. none).
-  The fix is standard and cheap: call `solvePnPGeneric`, and either reject the estimate when
-  the error ratio is below a threshold (the tag still contributes nothing worse than a
-  dropped frame) or disambiguate against the other visible tags and the previous pose. Note
-  that **multi-tag fusion does not rescue this on its own** — a flipped estimate enters the
-  weighted average with a full `decision_margin` weight, because the decode was clean; the
-  ambiguity is in the geometry, not the decode.
+
+  **The fix, and why it is rejection rather than disambiguation.** `tag_pose_in_camera` calls
+  `solvePnPGeneric` and reports `ratio = err[1]/err[0]`; `on_tags` drops any detection with
+  `ratio < min_pose_ratio` (default **1.5**, runtime-settable, `0.0` disables). Disambiguating
+  against the other visible tags was implemented and measured **first** — it only moved the
+  outlier rate 20.3% → 16.7%, because **75% of this bag is single-tag** and a lone tag has no
+  second opinion to check against. Rejection reached **6.6%** on the same data. The threshold
+  came from a sweep over two tank bags whose knee sits in the same place despite very different
+  motion; past 1.5 you pay ~10% of your fixes per point of outlier. 1.5 rather than 1.2 because
+  this is a *secondary absolute* layer correcting a drifting INS, so a trustworthy fix is worth
+  more than a frequent one.
+
+  | | fixes | >0.5 m outliers | pose rate |
+  |---|---|---|---|
+  | gate off | 497 | 101 (**20.3%**) | 13.8 Hz |
+  | **gate 1.5** | 347 (−30%) | 23 (**6.6%**) | 10.1 Hz |
+
+  **Cost is 27–30% of fixes and ~4 Hz**, acceptable only because the consumer is an EKF that
+  already dead-reckons between fixes. The gate is **provably inert on clean data**: on a static
+  two-tag bench fixture the median ratio is 4.36 and **0 of 3752** detections fall below any
+  gate up to 2.0.
+
+  **What remains, and why no gate can fix it: ~6.6% of fixes are still outliers.** A
+  *confidently wrong* solution — high ratio, wrong branch — is indistinguishable from a
+  confidently right one at the single-detection level, which is all this node sees. Removing
+  those needs temporal consistency against a motion model, which belongs in the EKF consuming
+  `/vessel_pose`, not here. Note also that **multi-tag fusion does not rescue this on its own**
+  — a flipped estimate enters the weighted average with a full `decision_margin` weight,
+  because the decode was clean; the ambiguity is in the geometry, not the decode.
 
 - **A single visible tag is worth ~0.3 m, and the two-pass fusion cannot help it.** With one
   tag there is no second rotation to average against, so fusion reduces to the old behaviour
   and the tag's own ill-conditioned orientation goes straight into its position — measured at
   **308 mm and 331 mm** for tags 1 and 3 at the same station where two-tag fusion scored
   26 mm. This is the *common* tank case, not an edge case, and it is currently published with
-  no indication that it is 12× worse than a two-tag fix. It needs a decision, not a bug fix:
-  carry the last multi-tag fused rotation forward, publish the fix flagged as low-confidence,
-  or suppress it. Note the error is a **stable systematic, not noise** — single-tag yaw is
-  repeatable to an IQR of 0.060° while being wrong by 5.58°, so no amount of temporal
-  averaging removes it.
+  no indication that it is 12× worse than a two-tag fix. Note the error is a **stable
+  systematic, not noise** — single-tag yaw is repeatable to an IQR of 0.060° while being wrong
+  by 5.58°, so no amount of temporal averaging removes it.
+
+  **This is a missing input, not a policy choice.** Measured on the 07-23 bag: giving every tag
+  one good rotation instead of its own takes inter-tag position disagreement from **0.341 m to
+  0.150 m**, and the per-tag disagreement is what produces the **0.148 m median step at every
+  tag handover** — the streaks visible in the uncut demo. The obvious workaround, *carry the
+  last multi-tag fused rotation forward*, was implemented and **refuted**: it makes single-tag
+  frames worse (median spread 0.047 m → 0.171 m), because the boat turns at a median 4.7°/s so
+  a one-second-old rotation is already staler than the error it replaces.
+
+  The fix is to take yaw from the **IMU/INS**. The two sensors are exactly complementary — tag
+  orientation is ill-conditioned (20–41°/px) while tag position from the same corners is ~40×
+  better determined, and the INS is the mirror image: good short-term yaw, drifting position.
+  `fuse()` is already two-pass and its second pass consumes exactly one rotation, so this is a
+  substitution rather than a redesign. It inverts a dependency, though — this node currently
+  only *produces* orientation — so it needs agreement from whoever owns the EKF.
+
+- **Tag-to-tag disagreement of ~0.15 m that rotation does not explain.** After the above, tags
+  still disagree by 0.150 m median. The remaining candidates are the unmeasured mount rotation
+  (below) and **error in the tag survey itself**: `tag_map.yaml`'s tank positions have never
+  been validated against the physical tank — every result here is from a lab-wall replica,
+  which tests the code, not the survey. A map error produces exactly this signature. Inter-tag
+  *distance* is the mount-independent way to check it.
 - **Mount rotation is still assumed, not measured.** `make_camera_mount()` takes the camera
   to be perfectly forward and level. Measure it through the camera's own optics rather than
   with a protractor: a tag at known height dead ahead projects to `(cx, cy)` only if the mount

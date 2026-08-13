@@ -9,6 +9,8 @@ from rclpy.executors import ExternalShutdownException
 from rclpy.qos import qos_profile_sensor_data
 from collections import namedtuple
 
+from rcl_interfaces.msg import SetParametersResult
+
 from apriltag_msgs.msg import AprilTagDetectionArray
 from sensor_msgs.msg import CameraInfo
 from geometry_msgs.msg import PoseStamped # adds a Header (timestamp+frame_id) + a Pose(a 3D position and an orientation quaternion)= 6 DoF + timing
@@ -207,6 +209,14 @@ def average_quats(quats, weights):
 # careless line away.
 TagEstimate = namedtuple('TagEstimate', 'tag_id T_W_B weight ratio t_C_T p_W_T')
 
+# Default for the min_pose_ratio parameter (Open Item #8). A module constant, not a
+# literal in declare_parameter(), because OFFLINE TOOLS MUST BE ABLE TO IMPORT IT --
+# tools/render_bag_demo.py reproduces the node's pipeline without constructing a Node,
+# so a hard-coded 1.5 there would be a second copy of a tuned threshold, free to drift
+# out of step with this one. Same failure that made the renderer draw one-pass fusion
+# after the node moved to two-pass. See __init__ for how 1.5 was chosen.
+DEFAULT_MIN_POSE_RATIO = 1.5
+
 
 class VesselLocalizer(Node):
     def __init__(self):
@@ -217,6 +227,51 @@ class VesselLocalizer(Node):
         map_path = self.get_parameter("tag_map_path").value
         self.declare_parameter("frame_id","map")
         self.frame_id = self.get_parameter("frame_id").value
+        # Open Item #8 rejection gate. Minimum acceptable err[1]/err[0] from
+        # solvePnPGeneric: how much worse the DISCARDED mirror solution fits than the
+        # one being used. Near 1.0 the two reproject almost identically and the branch
+        # was picked near-arbitrarily, so the published pose may be the mirrored one --
+        # which barely moves the tag's translation but rotates it ~20 deg, and inv(T_C_T)
+        # turns that into a position error of roughly range x angle.
+        #
+        # Default 1.5, chosen from a threshold sweep over two 2026-07-23 tank bags
+        # (>0.5 m from own +/-1 s local median):
+        #
+        #   gate   pivot bag           aggressive bag
+        #   none   100% kept / 19.9%   100% kept / 22.3%
+        #   1.2     81% kept /  8.3%    76% kept /  9.5%
+        #   1.5     70% kept /  6.9%    62% kept /  6.1%
+        #   2.0     53% kept /  6.1%    49% kept /  5.6%
+        #
+        # The knee sits in the same place on both bags despite very different data;
+        # past 1.5 you pay ~10% of your fixes per point of outlier. 1.2 is the
+        # defensible alternative if rate matters more than purity to the consumer.
+        # This is a SECONDARY absolute layer correcting a drifting INS, so trustworthy
+        # fixes are worth more than frequent ones -- hence 1.5 rather than 1.2.
+        #
+        # VERIFIED NOT TO TOUCH CLEAN DATA: on the static two-tag bench fixture the
+        # median ratio is 4.36 and 0 of 3752 detections fall below any gate up to 2.0.
+        #
+        # 0.0 DISABLES the gate, and needs no special case: `ratio` is a quotient of
+        # non-negative reprojection errors, so it is always >= 0 (or inf), and
+        # `ratio < 0.0` can never be true. Do not add a branch for it.
+        self.declare_parameter("min_pose_ratio", DEFAULT_MIN_POSE_RATIO)
+        self.min_pose_ratio = float(self.get_parameter("min_pose_ratio").value)
+
+        # Cumulative from node start, for tuning min_pose_ratio on real data: if the
+        # gate is throwing away most of what the detector finds, that is visible here
+        # rather than only as a low pose rate. Cumulative means they must be read as a
+        # rate over a whole run -- RESTART THE NODE between stations, same discipline
+        # as edge_fov_probe_v2's counters.
+        self.n_gated = 0 # detections rejected by the ambiguity gate
+        self.n_kept = 0  # detections that passed it
+
+        # min_pose_ratio is settable at RUNTIME, not just at launch. Without this the
+        # value above is read once here and `ros2 param set` appears to succeed while
+        # changing nothing -- the worst kind of knob. It matters because the only place
+        # the threshold can honestly be chosen is on the water, against the real
+        # geometry and the real consumer, and a relaunch there costs a station.
+        self.add_on_set_parameters_callback(self.on_set_parameters)
         self.tag_map = self.load_tag_map(map_path) #{id: (T_W_T 4x4, size)}
 
         # # camera mount: vessel <- camera. Fill from your measured mount
@@ -334,9 +389,14 @@ class VesselLocalizer(Node):
         range x angle. So range checks look fine while the vessel pose swings metres.
 
         solutions[0] is BIT-IDENTICAL to what solvePnP returned (verified 2026-08-10 on
-        real corners: max |diff| 0.0e+00 in both rvec and tvec), so THE PUBLISHED POSE IS
-        UNCHANGED by this swap. `ratio` is diagnostic only -- nothing is rejected or
-        reweighted on it yet.
+        real corners: max |diff| 0.0e+00 in both rvec and tvec), so swapping solvePnP for
+        solvePnPGeneric did not by itself change any published pose.
+
+        `ratio` is no longer diagnostic only: since 2026-08-12 on_tags REJECTS any
+        detection with ratio < min_pose_ratio. Measured on the 07-23 tank bags, the gate
+        cut the outlier rate 16.7% -> 3.0% (pivot) and 15.4% -> 2.3% (aggressive) for
+        ~27% of fixes. This method itself still only reports -- it never rejects, so it
+        stays reusable by offline tools that want the raw ratio distribution.
         """
         size = self.tag_map[det.id][1]
         obj = object_points(size)
@@ -363,7 +423,15 @@ class VesselLocalizer(Node):
         else:
             ratio = float('inf') # single solution, or an exact fit -> unambiguous
 
-        # solutions are sorted by reprojection error; [0] is what solvePnP would return
+        # [0] is what solvePnP would have returned (verified bit-identical 2026-08-10).
+        #
+        # It is NOT necessarily the better-fitting solution. An earlier version of this
+        # comment claimed the list is sorted by reprojection error -- MEASURED FALSE
+        # 2026-08-12: across 1498 detections from two tank bags, 7 had ratio < 1.0
+        # (minimum 0.8738), i.e. OpenCV handed back the WORSE-fitting branch first.
+        # Those are the most suspect detections there are, and the min_pose_ratio gate
+        # rejects all of them. solvePnPGeneric also returned exactly 2 solutions on
+        # every one of those 1498 solves, so the inf branch above is defensive only.
         rvec, tvec = rvecs[0], tvecs[0]
         R, _ = cv2.Rodrigues(rvec) #3x3 rotation matrix
 
@@ -372,6 +440,66 @@ class VesselLocalizer(Node):
         T_C_T[:3,3] = tvec.flatten()
         return T_C_T, ratio # tag in camera frame (4x4), + IPPE ambiguity ratio
     
+    def on_set_parameters(self, params):
+        """Validate and apply runtime parameter changes (`ros2 param set`).
+
+        Registered in __init__. rclpy calls this BEFORE committing a change, with
+        every parameter in the request; returning successful=False rejects the whole
+        request and leaves the node untouched. So this is the only place that can
+        refuse a bad value -- the gate's use site cannot, it just compares numbers.
+
+        Only min_pose_ratio is handled. Anything else is accepted unchanged, because
+        the remaining parameters (tag_map_path, frame_id) are read once at startup and
+        silently ignoring a set on them would be the exact trap this method exists to
+        remove; they are rejected explicitly instead.
+
+        The threshold is the one number that can only honestly be chosen against real
+        geometry, and on the water a relaunch costs a station. Sweep it live:
+
+            ros2 param set /vessel_localizer min_pose_ratio 1.2
+
+        Changing it RESETS the gate tally. gate_summary() reports a rate since node
+        start; across a threshold change that rate is an average of two different
+        gates, which is worse than useless because it still looks like a measurement.
+        """
+        for p in params:
+            if p.name != "min_pose_ratio":
+                return SetParametersResult(
+                    successful=False,
+                    reason=f"{p.name} is read once at startup; set it at launch, not at runtime")
+
+            # Reject rather than clamp. A negative gate is not a weaker gate -- ratio is
+            # a quotient of non-negative errors, so ANY negative value disables the gate
+            # entirely while reading in `ros2 param get` as if it were set. Use 0.0 for
+            # that, which says so.
+            if p.value < 0.0:
+                return SetParametersResult(
+                    successful=False,
+                    reason=f"min_pose_ratio must be >= 0.0 (got {p.value}); use 0.0 to disable the gate")
+
+            old = self.min_pose_ratio
+            self.min_pose_ratio = float(p.value)
+            self.get_logger().info(
+                f"min_pose_ratio {old} -> {self.min_pose_ratio} "
+                f"(tally reset; previous: {self.gate_summary()})")
+            self.n_gated = 0
+            self.n_kept = 0
+
+        return SetParametersResult(successful=True)
+
+    def gate_summary(self):
+        """One-line running tally of the Open Item #8 ambiguity gate, since node start.
+
+        Reported alongside every log line the gate produces so the rejection rate is
+        never something you have to go and measure separately. On the 2026-07-23 tank
+        bags roughly 30-40% is normal at the 1.5 default; on the clean static bench
+        fixture it is 0%. A rate far outside that band means the geometry changed, not
+        that the threshold is wrong.
+        """
+        total = self.n_gated + self.n_kept
+        pct = 100.0 * self.n_gated / total if total else 0.0
+        return f"{self.n_gated}/{total} detections gated ({pct:.0f}%)"
+
     def on_tags(self, msg: AprilTagDetectionArray):
         """Subscription callback for /tags: turn detected tags into a vessel pose.
 
@@ -399,6 +527,7 @@ class VesselLocalizer(Node):
         if self.K is None:
             return # no intrinsics yet
         estimates = [] # list of TagEstimate, one per surviving detection
+        n_gated = 0    # rejected by the Open Item #8 ambiguity gate, THIS frame
         for det in msg.detections:
             if det.id not in self.tag_map:
                 continue # unknown tag, skip
@@ -408,6 +537,16 @@ class VesselLocalizer(Node):
             T_C_T, ratio = self.tag_pose_in_camera(det)
             if T_C_T is None:
                 continue # could not solvePnP for this tag
+
+            if ratio < self.min_pose_ratio:
+                # Reject: the mirror solution fit nearly as well, so the branch was
+                # picked near-arbitrarily. A dropped frame beats a fix that is metres
+                # out with a clean decision_margin. Counted, never silent -- see below.
+                n_gated += 1
+                self.n_gated += 1
+                continue
+
+            self.n_kept += 1
 
             T_W_T = self.tag_map[det.id][0]
             #THE CHAIN
@@ -422,6 +561,16 @@ class VesselLocalizer(Node):
                 p_W_T=T_W_T[:3,3]))         # tag in world, straight from the map
 
         if not estimates:
+            # Distinguish "nothing was visible" from "everything visible was rejected".
+            # Without this they look identical in the logs, and the second one is the
+            # case that will confuse you on the water: tags plainly in frame, decoding
+            # cleanly, and no pose coming out. Same failure of observability that made
+            # a 3.6%-detection station indistinguishable from a healthy one in 2026-08-05.
+            if n_gated:
+                self.get_logger().warn(
+                    f"no pose: all {n_gated} mapped detection(s) rejected as ambiguous "
+                    f"(ratio < {self.min_pose_ratio}). Session: {self.gate_summary()}",
+                    throttle_duration_sec=2.0)
             return
 
         # Fusion-validation logging: with >=2 tags, print each tag's independent
@@ -437,7 +586,9 @@ class VesselLocalizer(Node):
                     f"  ratio={e.ratio:5.2f}") # Open Item #8: ~1 means the branch was a coin flip
 
             self.get_logger().info(
-                f"FUSION: {len(estimates)} tags visible\n" + "\n".join(lines),
+                f"FUSION: {len(estimates)} tags visible"
+                + (f", {n_gated} gated" if n_gated else "")
+                + f"  [{self.gate_summary()}]\n" + "\n".join(lines),
                 throttle_duration_sec=1.0)
             
         t, q = self.fuse(estimates)

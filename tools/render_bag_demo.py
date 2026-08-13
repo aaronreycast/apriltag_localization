@@ -109,34 +109,39 @@ def load_tag_map(path):
             for i, e in d['tags'].items()}
 
 
-def tag_pose_in_camera(corners, size, K, D):
-    """`VesselLocalizer.tag_pose_in_camera`: message corners are BL,BR,TR,TL and must be
-    reversed to the TL,TR,BR,BL that IPPE_SQUARE expects."""
-    obj = ln.object_points(size)
-    img = np.array([[corners[3].x, corners[3].y], [corners[2].x, corners[2].y],
-                    [corners[1].x, corners[1].y], [corners[0].x, corners[0].y]], np.float64)
-    ok, rvec, tvec = cv2.solvePnP(obj, img, K, D, flags=cv2.SOLVEPNP_IPPE_SQUARE)
-    if not ok:
-        return None
-    R, _ = cv2.Rodrigues(rvec)
-    return ln.make_T(R, tvec.flatten())
+def solve_frame(dets, tag_map, K, D, T_B_C, min_pose_ratio):
+    """`VesselLocalizer.on_tags`: per-tag chain, ambiguity gate, then the node's fusion.
 
+    Both non-trivial stages -- the PnP solve and the fusion -- are delegated to
+    VesselLocalizer's own methods rather than reimplemented here. `self` is stood in
+    for by a SimpleNamespace carrying the four attributes those methods read, so no
+    Node, no rclpy context and no ROS graph is needed.
 
-def solve_frame(dets, tag_map, K, D, T_B_C):
-    """`VesselLocalizer.on_tags`: per-tag chain, then the node's own fusion.
+    That indirection is deliberate and has been earned twice. Fusion used to be
+    inlined and went stale on 2026-08-11 when the node moved to TWO-PASS fusion
+    (Open Item #9); the PnP solve used to be inlined and went stale on 2026-08-12
+    when the node started REJECTING ambiguous solutions (Open Item #8). Both times
+    this renderer would have kept drawing superseded maths while the README claimed
+    it showed shipped code -- the worst kind of stale, because the output still looks
+    plausible. The rule this file now follows: it may reproduce the node's plumbing
+    (which detections to consider, what to draw), never its mathematics.
 
-    Fusion is delegated to VesselLocalizer.fuse() rather than reimplemented here.
-    It used to be inlined, and that inlining silently went stale on 2026-08-11 when
-    fusion became TWO-PASS (Open Item #9) -- this renderer would have kept drawing
-    the old one-pass result while claiming to show shipped code. fuse() only touches
-    self.T_B_C, so a SimpleNamespace is a sufficient stand-in for the node.
+    The gate is the reason the old local solvePnP had to go: solvePnP returns one
+    solution with no signal about the other, so there was no ratio to threshold on.
     """
+    node = SimpleNamespace(tag_map=tag_map, K=K, D=D, T_B_C=T_B_C)
     ests, ids, ranges = [], [], {}
+    n_gated = 0
     for tag_id, corners, margin in dets:
         if tag_id not in tag_map or margin < 30.0:
             continue
-        T_C_T = tag_pose_in_camera(corners, tag_map[tag_id][1], K, D)
+        # det stand-in: tag_pose_in_camera reads only .id and .corners off the message.
+        det = SimpleNamespace(id=tag_id, corners=corners)
+        T_C_T, ratio = ln.VesselLocalizer.tag_pose_in_camera(node, det)
         if T_C_T is None:
+            continue
+        if ratio < min_pose_ratio:   # Open Item #8 gate, same test as on_tags
+            n_gated += 1
             continue
         T_W_T = tag_map[tag_id][0]
         ranges[tag_id] = float(np.linalg.norm(T_C_T[:3, 3]))
@@ -144,15 +149,18 @@ def solve_frame(dets, tag_map, K, D, T_B_C):
             tag_id=tag_id,
             T_W_B=T_W_T @ ln.invert_T(T_C_T) @ ln.invert_T(T_B_C),
             weight=margin,
-            ratio=float('nan'),          # Open Item #8 diagnostic, unused by fuse()
+            ratio=ratio,
             t_C_T=T_C_T[:3, 3],
             p_W_T=T_W_T[:3, 3]))
         ids.append(tag_id)
+    # n_gated is returned even when there is no fix, so the caller can tell "nothing
+    # decoded" from "everything decoded was rejected" -- on screen those two look
+    # identical otherwise, and the second is the one that explains a gap in the track.
     if not ests:
-        return None
+        return None, n_gated
     t, q = ln.VesselLocalizer.fuse(SimpleNamespace(T_B_C=T_B_C), ests)
     _, _, yaw = ln.quat_to_euler(q)
-    return dict(ids=ids, t=t, yaw=yaw, ranges=ranges)
+    return dict(ids=ids, t=t, yaw=yaw, ranges=ranges), n_gated
 
 
 def camera_mount():
@@ -293,6 +301,10 @@ def main():
     p.add_argument('--image-topic', default='/camera/image_raw')
     p.add_argument('--tags-topic', default='/tags')
     p.add_argument('--fps', type=int, default=30)
+    p.add_argument('--min-pose-ratio', type=float, default=ln.DEFAULT_MIN_POSE_RATIO,
+                   help='Open Item #8 ambiguity gate; 0.0 disables it. Defaults to the '
+                        "node's own default, imported -- do not hard-code it here. "
+                        'Pass 0.0 to render pre-gate behaviour for a before/after.')
     p.add_argument('--tank', default='14.0,5.0', help='drawn tank extent "length,width" (m)')
     p.add_argument('--title', default='apriltag_localization  -  vessel_localizer')
     p.add_argument('--subtitle', default='')
@@ -313,7 +325,7 @@ def main():
 
     t0 = None
     recent, cloud, last = [], [], None
-    n_fix = n_frame = 0
+    n_fix = n_frame = n_gated_total = 0
     while reader.has_next():
         name, data, _ = reader.read_next()
         if name != args.image_topic:
@@ -334,7 +346,9 @@ def main():
             full = cv2.cvtColor(full, cv2.COLOR_RGB2BGR)
         panel = cv2.resize(full, (CAM_W, CAM_H), interpolation=cv2.INTER_AREA)
 
-        res = solve_frame(tags[stamp], tag_map, K, D, T_B_C) if stamp in tags else None
+        res, n_gated = (solve_frame(tags[stamp], tag_map, K, D, T_B_C, args.min_pose_ratio)
+                        if stamp in tags else (None, 0))
+        n_gated_total += n_gated
         dets = []
         if res:
             n_fix += 1
@@ -370,14 +384,26 @@ def main():
             txt(canvas, f'x {last[0]:+6.2f} m    y {last[1]:+6.2f} m    '
                         f'yaw {math.degrees(last[2]):+7.1f} deg', (CAM_X, hy + 28), 0.56, ACCENT)
         else:
-            cv2.circle(canvas, (CAM_X + 130, hy - 5), 5, (70, 70, 90), -1)
-            txt(canvas, 'no tag decoded this frame', (CAM_X + 145, hy), 0.5, DIM)
+            # Distinguish the two ways a frame can produce no fix. They look the same
+            # on screen otherwise, and after the Open Item #8 gate the second one is a
+            # deliberate rejection, not a detection failure -- labelling it "no tag
+            # decoded" would misreport the gate as a weakness of the detector.
+            if n_gated:
+                cv2.circle(canvas, (CAM_X + 130, hy - 5), 5, (70, 130, 200), -1)
+                txt(canvas, f'{n_gated} detection(s) rejected - ambiguous pose',
+                    (CAM_X + 145, hy), 0.5, (140, 180, 230))
+            else:
+                cv2.circle(canvas, (CAM_X + 130, hy - 5), 5, (70, 70, 90), -1)
+                txt(canvas, 'no tag decoded this frame', (CAM_X + 145, hy), 0.5, DIM)
             if last:
                 txt(canvas, f'last fix  x {last[0]:+6.2f} m   y {last[1]:+6.2f} m   '
                             f'yaw {math.degrees(last[2]):+7.1f} deg',
                     (CAM_X, hy + 28), 0.56, DIM)
+        gate_note = (f'ambiguity gate {args.min_pose_ratio:.1f}, {n_gated_total} rejected'
+                     if args.min_pose_ratio > 0 else 'ambiguity gate OFF')
         txt(canvas, f'frames with a fix, this excerpt: {100 * n_fix / max(1, n_frame):4.1f} %   '
-                    '(raw per-frame output, no filtering)', (CAM_X, hy + 54), 0.42, DIM)
+                    f'(raw per-frame output, no smoothing; {gate_note})',
+            (CAM_X, hy + 54), 0.42, DIM)
         txt(canvas, f'intrinsics: {os.path.basename(args.calib)}   |   camera mount t_B_C: '
                     f'[{mount[0]:.2f}, {mount[1]:.2f}, {mount[2]:.2f}] m',
             (CAM_X, hy + 76), 0.42, (110, 106, 102))
@@ -393,7 +419,9 @@ def main():
     ff.stdin.close()
     ff.wait()
     print(f'{n_frame} frames, {n_fix} with a fix '
-          f'({100 * n_fix / max(1, n_frame):.1f}%) -> {args.out}')
+          f'({100 * n_fix / max(1, n_frame):.1f}%), '
+          f'{n_gated_total} detections gated at min_pose_ratio={args.min_pose_ratio} '
+          f'-> {args.out}')
 
 
 if __name__ == '__main__':
