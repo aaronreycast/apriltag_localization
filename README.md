@@ -126,10 +126,10 @@ What is worth reading in it:
   x and 0.24 m in y**; restricted to the two-tag stretch after the handover, **0.80 m and
   0.16 m**. The y figure is the one to watch — before the two-pass fusion change it was
   **0.73 m** over that same stretch, a 4.6× difference on identical input.
-- **`frames with a fix: 48 %`** in the excerpt. Across the whole bag it is **32.4%**: of 1069
+- **`frames with a fix: 48 %`** in the excerpt. Across the whole bag it is **31.3%**: of 1069
   camera frames the detector emitted `/tags` for 592 (55%) — this is the 1080p throughput
-  collapse that later drove the switch to 720p — and of the detections in those frames, **205
-  were rejected by the ambiguity gate**, leaving 346 published poses. Without the gate it is
+  collapse that later drove the switch to 720p — and of the detections in those frames, **224
+  were rejected by the two gates**, leaving 335 published poses. With no gates at all it is
   46.2% / 494 poses. So roughly **a third of the drop-outs you see are now deliberate**: frames
   where the overlay shows a tag but no fix appear as `N detection(s) rejected - ambiguous pose`
   rather than as detector misses, and the two are labelled separately on purpose.
@@ -144,7 +144,7 @@ rate to **6.6%** and took the number of flip-free stretches ≥2 s from 5 to 8, 
 against the previously published clip, and it is no longer the only clean part of the run.
 
 **The uncut 36 s render is kept alongside it** at
-[`docs/media/demo_full_uncut.mp4`](docs/media/demo_full_uncut.mp4). The accumulating scatter in
+[`docs/media/demo_1080p_full_uncut.mp4`](docs/media/demo_1080p_full_uncut.mp4). The accumulating scatter in
 its map panel is the clearest single piece of evidence for the gate: rendered with
 `--min-pose-ratio 0.0` the cloud sprays a smeared tail across ~4 m of tank; at the 1.5 default
 it is a compact blob on the vessel. Both renders come from the same command with one flag
@@ -181,6 +181,7 @@ result does not predict and which no ground truth here can adjudicate.
 |------|---------|-------------|
 | `tag_map_path` | `config/tag_map.yaml` (via launch) | Absolute path to the tag-map YAML |
 | `frame_id` | `map` | World frame stamped into `header.frame_id` of the published pose. **Must match what the downstream EKF expects** — a mismatch corrupts fusion silently. Not exposed as a launch argument; override with `--ros-args -p frame_id:=...`. |
+| `max_u_off` | `0.90` | Off-axis rejection gate: maximum `\|u − cx\| / (width/2)` for a detection to be used — `0.0` is the image centre, `1.0` the left/right edge. The outer sliver of this wide field produces catastrophic fixes (median residual **3.09 m** beyond 80% of half-width, against 0.025–0.045 m everywhere inside it); rejecting it takes the >0.5 m outlier rate from **6.9% to 1.2%** for 3% of the fixes. Normalised rather than in pixels so one default is right at every resolution. **Runtime-settable.** Any value ≥ `1.01` disables it (use `2.0`); `\|u_off\|` cannot exceed ~1.0004, so no special case is needed. |
 | `min_pose_ratio` | `1.5` | Planar-ambiguity rejection gate: minimum `err[1]/err[0]` from `solvePnPGeneric` for a detection to be used. See [Open work](#open-work) for how 1.5 was chosen and what it costs. **`0.0` disables it.** Unlike the two above, this one is **settable at runtime** — `ros2 param set /vessel_localizer min_pose_ratio 1.2` — because it is the one value that can only honestly be tuned against real geometry, and on the water a relaunch costs a station. Changing it resets the gate tally. A negative value is rejected rather than clamped. |
 
 > **`/tags` rate is not the pose rate.** The detector publishes an `AprilTagDetectionArray`
@@ -271,6 +272,9 @@ current operating resolution of **720p**. Full log:
 | **Single** visible tag, same station | **~0.3 m radial** (308 mm tag 1, 331 mm tag 3) — see [Open work](#open-work) | 2026-08-11 |
 | **Ambiguity gate, on-water bag** (`min_pose_ratio` 1.5) | >0.5 m outliers **20.3% → 6.6%** for 30% of fixes; pose rate 13.8 → 10.1 Hz | 2026-08-12 |
 | Ambiguity gate on clean data | **inert — 0 of 3752** static-fixture detections gated at any threshold up to 2.0 | 2026-08-12 |
+| **Off-axis gate** (`max_u_off` 0.90), on-water bag | >0.5 m outliers **6.9% → 1.2%** for 3% of fixes; replicates on a second bag (6.1% → 3.5%) | 2026-08-13 |
+| Off-axis gate on clean data | **inert — all six DoF identical to four decimals**, 0 detections rejected on the static fixture | 2026-08-13 |
+| 480p vs 1080p, same station type | 480p is **worse**: 25.6% vs 6.9% outliers, tags at 64% the pixels, two tags visible in 3% of frames vs 19% | 2026-08-13 |
 
 **Ranges are metric at all three resolutions.** The original ~+7.2% range-scale error was a
 calibration fault, not a localization one: the checkerboard calibrator is unstable on this
@@ -325,7 +329,23 @@ apart. Procedure: `apriltag_detector/docs/CAMERA_CALIBRATION.md` §5c.
   two-tag bench fixture the median ratio is 4.36 and **0 of 3752** detections fall below any
   gate up to 2.0.
 
-  **What remains, and why no gate can fix it: ~6.6% of fixes are still outliers.** A
+  **One flipped tag poisons the whole frame — the two-pass trade.** Worked example from the
+  demo bag at t = 0.732 s: tag 1 solo gives (6.495, 2.945), correct; tag 2 takes the wrong
+  branch for that one frame (solo yaw +63.4° against tag 1's −176.5°, ratio **2.90** — well
+  above the gate) and the fused result is (6.422, 0.222), **2.7 m worse than the better of its
+  two inputs**. Pass 1 averages the rotations weighted by `decision_margin`, so the bad one
+  still gets 38% of the vote; pass 2 then derives *every* tag's position from that corrupted
+  rotation. Two-pass fusion buys ~130 mm in the normal case by making a single bad rotation
+  able to poison the frame — a strongly positive trade, but **more tags is more robust on
+  average and can be worse in the tail.** The ranges are never the problem: trilateration from
+  the two ranges alone gives (6.07, 2.66), right where the boat is.
+
+  **An inter-tag yaw-agreement gate was implemented and measured, and is deliberately NOT
+  shipped.** It catches that frame and almost nothing else (pivot 1.19% → 0.90%, aggressive
+  unchanged), and it cannot be tightened — genuine per-tag yaw disagreement runs 2.4–11.6°, so
+  at a 10° threshold it discards legitimate tags and the outlier rate *rises* to 1.81%.
+
+  **What remains, and why no gate can fix it: ~1–3% of fixes are still outliers.** A
   *confidently wrong* solution — high ratio, wrong branch — is indistinguishable from a
   confidently right one at the single-detection level, which is all this node sees. Removing
   those needs temporal consistency against a motion model, which belongs in the EKF consuming
@@ -356,6 +376,22 @@ apart. Procedure: `apriltag_detector/docs/CAMERA_CALIBRATION.md` §5c.
   `fuse()` is already two-pass and its second pass consumes exactly one rotation, so this is a
   substitution rather than a redesign. It inverts a dependency, though — this node currently
   only *produces* orientation — so it needs agreement from whoever owns the EKF.
+
+- **The outer ~10% of the frame is unusable, and is now rejected rather than trusted.**
+  Measured within each bag, so there is no cross-run confound: median residual of single-tag
+  fixes is 0.025 m near the optical axis and rises gently to 0.045 m at 80% of half-width —
+  then jumps to **3.09 m** beyond it. `max_u_off` discards that sliver, taking the outlier
+  rate from 6.9% to 1.2% for 3% of the fixes, and it replicates on an independent bag.
+  Consistent with the off-axis certification, which independently found −3.06% at 85% and
+  flagged 85% as failing.
+
+  **This is not "use a narrower camera".** Rendering the same kind of run at 480p — a
+  genuinely narrower 4:3 field — is worse on every measure: **25.6% outliers against 6.9%**,
+  because tags cover 64% as many pixels (`fx` 424 vs 948, and yaw conditioning is driven by
+  exactly that) and because the narrow field sees two tags in only **3%** of frames against
+  19%. Multi-tag fixes are the accurate ones (~26 mm vs ~0.3 m), so narrowing the field
+  trades away the mechanism that delivers accuracy in order to avoid a sliver that a
+  one-line gate removes for free. The wide field is an asset; only its outer edge is not.
 
 - **Tag-to-tag disagreement of ~0.15 m that rotation does not explain.** After the above, tags
   still disagree by 0.150 m median. The remaining candidates are the unmeasured mount rotation

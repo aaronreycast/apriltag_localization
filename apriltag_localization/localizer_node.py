@@ -217,6 +217,12 @@ TagEstimate = namedtuple('TagEstimate', 'tag_id T_W_B weight ratio t_C_T p_W_T')
 # after the node moved to two-pass. See __init__ for how 1.5 was chosen.
 DEFAULT_MIN_POSE_RATIO = 1.5
 
+# Default for the max_u_off parameter (off-axis rejection gate). Module constant for the
+# same reason as above -- offline tools reproduce the node's pipeline without constructing
+# a Node, and a tuned threshold must not exist in two places. See __init__ for how 0.90
+# was chosen.
+DEFAULT_MAX_U_OFF = 0.90
+
 
 class VesselLocalizer(Node):
     def __init__(self):
@@ -258,13 +264,58 @@ class VesselLocalizer(Node):
         self.declare_parameter("min_pose_ratio", DEFAULT_MIN_POSE_RATIO)
         self.min_pose_ratio = float(self.get_parameter("min_pose_ratio").value)
 
+        # Off-axis rejection gate. Maximum |u - cx| / (width/2) for a detection to be
+        # used: 0.0 is the image centre, 1.0 the left/right edge. NORMALIZED, not pixels,
+        # so one default is correct at every resolution -- a pixel threshold would
+        # silently mean three different things across 480p/720p/1080p.
+        #
+        # WHY -- measured 2026-08-13 on the 07-23 bags, median residual of single-tag
+        # fixes against their own +/-1 s local median, binned by off-axis position:
+        #
+        #   |u_off|     0.0-0.2  0.2-0.4  0.4-0.6  0.6-0.8   0.8-1.0
+        #   1080p        0.025    0.032    0.040    0.045     3.087 m
+        #
+        # The field is well behaved to ~80% of half-width and then collapses. Rejecting
+        # the outermost sliver:
+        #
+        #   pivot 1080p       6.9% -> 1.2% outliers, costing 11 of 347 fixes
+        #   aggressive 1080p  6.1% -> 3.5% outliers, costing 15 of 362 fixes
+        #
+        # 0.90, 0.80 and 0.70 give IDENTICAL results on both bags, so the knee is clean
+        # and cutting deeper only throws away good fixes. Independently consistent with
+        # the 2026-08-10 off-axis certification (flat -0.7% to ~70% of half-width,
+        # -3.06% at 85%, flagged as failing at 85%).
+        #
+        # THIS IS NOT "REDUCE THE FOV". The camera still sees the full field and every
+        # tag is still detected; only a detection's contribution to the POSE is dropped
+        # while it sits in the outer sliver, and it is usually back in the good zone a
+        # frame or two later. Narrowing the field for real is strictly worse: at 480p
+        # the same tag covers 64% as many pixels AND two tags are visible in 3% of
+        # frames instead of 19%, giving 25.6% outliers against 1080p's 6.9%.
+        #
+        # Gate on |u_off| and NOT on radius: wall-mounted tags viewed from a boat sit in
+        # a narrow vertical band -- measured |v_off| <= 0.25 while |u_off| reaches 0.98 --
+        # so a radial gate is near-identical while adding a term. Revisit only if tags
+        # ever appear high or low in frame.
+        #
+        # Any value >= 1.01 DISABLES the gate and needs no special case: |u_off| cannot
+        # exceed ~1.0004 (cx is 959.65, not exactly width/2), so the test can never fire.
+        # Use 2.0 to disable, the same way min_pose_ratio uses 0.0.
+        self.declare_parameter("max_u_off", DEFAULT_MAX_U_OFF)
+        self.max_u_off = float(self.get_parameter("max_u_off").value)
+
         # Cumulative from node start, for tuning min_pose_ratio on real data: if the
         # gate is throwing away most of what the detector finds, that is visible here
         # rather than only as a low pose rate. Cumulative means they must be read as a
         # rate over a whole run -- RESTART THE NODE between stations, same discipline
         # as edge_fov_probe_v2's counters.
-        self.n_gated = 0 # detections rejected by the ambiguity gate
-        self.n_kept = 0  # detections that passed it
+        self.n_gated = 0      # detections rejected by the AMBIGUITY gate
+        self.n_edge_gated = 0 # detections rejected by the OFF-AXIS gate
+        self.n_kept = 0       # detections that passed both
+        # Counted separately on purpose. With one shared tally you cannot tell which gate
+        # is discarding your fixes, and the two mean opposite things: a high ambiguity
+        # count says the geometry is ill-conditioned, a high edge count says the tags are
+        # simply off to one side and the boat should be pointed differently.
 
         # min_pose_ratio is settable at RUNTIME, not just at launch. Without this the
         # value above is read once here and `ros2 param set` appears to succeed while
@@ -280,6 +331,7 @@ class VesselLocalizer(Node):
         # intrinsics, filled once camera_info arrives
         self.K = None
         self.D = None
+        self.img_w = None
 
         # --- Subscriptions ---
         # camera_info is 'latching-ish' but just cache the latest one.
@@ -299,6 +351,8 @@ class VesselLocalizer(Node):
         self.K = np.array(msg.k, dtype=np.float64).reshape(3,3)
         # D = [k1, k2, p1, p2, k3]
         self.D = np.array(msg.d, dtype=np.float64)
+        # Image width
+        self.img_w = msg.width
     
     def load_tag_map(self, path):
         """Load the tag map YAML into {id: (T_W_T 4x4, size)}.
@@ -448,41 +502,70 @@ class VesselLocalizer(Node):
         request and leaves the node untouched. So this is the only place that can
         refuse a bad value -- the gate's use site cannot, it just compares numbers.
 
-        Only min_pose_ratio is handled. Anything else is accepted unchanged, because
-        the remaining parameters (tag_map_path, frame_id) are read once at startup and
-        silently ignoring a set on them would be the exact trap this method exists to
-        remove; they are rejected explicitly instead.
+        The two GATE THRESHOLDS are settable; everything else is refused. tag_map_path
+        and frame_id are read once at startup, and silently ignoring a set on them would
+        be the exact trap this method exists to remove, so they are rejected explicitly
+        rather than accepted-and-ignored.
 
-        The threshold is the one number that can only honestly be chosen against real
-        geometry, and on the water a relaunch costs a station. Sweep it live:
+        Both thresholds can only honestly be chosen against real geometry, and on the
+        water a relaunch costs a station. Sweep them live:
 
             ros2 param set /vessel_localizer min_pose_ratio 1.2
+            ros2 param set /vessel_localizer max_u_off 0.85
 
-        Changing it RESETS the gate tally. gate_summary() reports a rate since node
-        start; across a threshold change that rate is an average of two different
-        gates, which is worse than useless because it still looks like a measurement.
+        VALIDATE EVERYTHING FIRST, THEN APPLY. rclpy hands over every parameter in the
+        request and a False return rejects the WHOLE request, so applying as we validate
+        would leave the node half-changed after a rejected call -- set both thresholds
+        at once with the second one invalid, and the first would have been committed
+        while the caller is told the request failed. Harmless while only one parameter
+        was writable; a real defect the moment a second one was added.
+
+        Changing a threshold RESETS its gate tally. gate_summary() reports a rate since
+        node start; across a threshold change that rate averages two different gates,
+        which is worse than useless because it still looks like a measurement.
         """
+        # --- Pass 1: validate. Touch no state. ---
         for p in params:
-            if p.name != "min_pose_ratio":
+            if p.name == "min_pose_ratio":
+                # Reject rather than clamp. A negative gate is not a weaker gate -- ratio
+                # is a quotient of non-negative errors, so ANY negative value disables the
+                # gate entirely while reading in `ros2 param get` as if it were set. Use
+                # 0.0 for that, which says so.
+                if p.value < 0.0:
+                    return SetParametersResult(
+                        successful=False,
+                        reason=f"min_pose_ratio must be >= 0.0 (got {p.value}); "
+                               "use 0.0 to disable the gate")
+            elif p.name == "max_u_off":
+                # Same reasoning, opposite direction: |u_off| is a non-negative distance,
+                # so a negative threshold rejects EVERY detection and the node goes
+                # silent while the parameter reads back as if it were set. Values >= 1.01
+                # are legal and mean "accept the whole frame", so there is no upper bound.
+                if p.value < 0.0:
+                    return SetParametersResult(
+                        successful=False,
+                        reason=f"max_u_off must be >= 0.0 (got {p.value}); it is a "
+                               "normalized distance from the image centre -- use 2.0 "
+                               "to disable the gate")
+            else:
                 return SetParametersResult(
                     successful=False,
                     reason=f"{p.name} is read once at startup; set it at launch, not at runtime")
 
-            # Reject rather than clamp. A negative gate is not a weaker gate -- ratio is
-            # a quotient of non-negative errors, so ANY negative value disables the gate
-            # entirely while reading in `ros2 param get` as if it were set. Use 0.0 for
-            # that, which says so.
-            if p.value < 0.0:
-                return SetParametersResult(
-                    successful=False,
-                    reason=f"min_pose_ratio must be >= 0.0 (got {p.value}); use 0.0 to disable the gate")
-
-            old = self.min_pose_ratio
-            self.min_pose_ratio = float(p.value)
-            self.get_logger().info(
-                f"min_pose_ratio {old} -> {self.min_pose_ratio} "
-                f"(tally reset; previous: {self.gate_summary()})")
-            self.n_gated = 0
+        # --- Pass 2: apply. Every value is known good by here. ---
+        for p in params:
+            if p.name == "min_pose_ratio":
+                old, self.min_pose_ratio = self.min_pose_ratio, float(p.value)
+                self.get_logger().info(
+                    f"min_pose_ratio {old} -> {self.min_pose_ratio} "
+                    f"(tally reset; previous: {self.gate_summary()})")
+                self.n_gated = 0
+            else:
+                old, self.max_u_off = self.max_u_off, float(p.value)
+                self.get_logger().info(
+                    f"max_u_off {old} -> {self.max_u_off} "
+                    f"(tally reset; previous: {self.gate_summary()})")
+                self.n_edge_gated = 0
             self.n_kept = 0
 
         return SetParametersResult(successful=True)
@@ -496,9 +579,15 @@ class VesselLocalizer(Node):
         fixture it is 0%. A rate far outside that band means the geometry changed, not
         that the threshold is wrong.
         """
-        total = self.n_gated + self.n_kept
-        pct = 100.0 * self.n_gated / total if total else 0.0
-        return f"{self.n_gated}/{total} detections gated ({pct:.0f}%)"
+        rejected = self.n_gated + self.n_edge_gated
+        total = rejected + self.n_kept
+        pct = 100.0 * rejected / total if total else 0.0
+        # Both gates broken out, never a single number. They mean opposite things and
+        # call for opposite responses: ambiguity says the geometry is ill-conditioned
+        # (nothing to do from the helm), off-axis says the tags are simply to one side
+        # and pointing the boat differently fixes it.
+        return (f"{rejected}/{total} detections gated ({pct:.0f}%): "
+                f"{self.n_gated} ambiguous, {self.n_edge_gated} off-axis")
 
     def on_tags(self, msg: AprilTagDetectionArray):
         """Subscription callback for /tags: turn detected tags into a vessel pose.
@@ -528,10 +617,22 @@ class VesselLocalizer(Node):
             return # no intrinsics yet
         estimates = [] # list of TagEstimate, one per surviving detection
         n_gated = 0    # rejected by the Open Item #8 ambiguity gate, THIS frame
+        n_edge = 0     # rejected by the off-axis gate, THIS frame
         for det in msg.detections:
             if det.id not in self.tag_map:
                 continue # unknown tag, skip
             if det.decision_margin < 30.0: # reject weak detections (tune threshold as needed
+                continue
+
+            # Off-axis gate, BEFORE the solve. This is a property of where the detection
+            # sits in the frame, not of the pose, so it needs no PnP -- and rejecting here
+            # skips a solvePnPGeneric on every discarded detection. Cheapest test first.
+            # self.K and self.img_w are both safe: on_tags returns early without
+            # intrinsics, and camera_info fills all three in the same callback.
+            u = np.mean([c.x for c in det.corners])
+            if abs(u - self.K[0,2]) / (self.img_w/2) > self.max_u_off:
+                n_edge += 1
+                self.n_edge_gated += 1
                 continue
 
             T_C_T, ratio = self.tag_pose_in_camera(det)
@@ -566,10 +667,20 @@ class VesselLocalizer(Node):
             # case that will confuse you on the water: tags plainly in frame, decoding
             # cleanly, and no pose coming out. Same failure of observability that made
             # a 3.6%-detection station indistinguishable from a healthy one in 2026-08-05.
-            if n_gated:
+            # BOTH gates must be able to raise this, and the message must say WHICH one
+            # fired. They call for opposite responses -- "ambiguous" means the geometry
+            # is ill-conditioned and there is nothing to do from the helm; "off-axis"
+            # means the tags are simply to one side and pointing the boat differently
+            # fixes it. A bare "no pose" tells the operator neither.
+            if n_gated or n_edge:
+                why = []
+                if n_gated:
+                    why.append(f"{n_gated} ambiguous (ratio < {self.min_pose_ratio})")
+                if n_edge:
+                    why.append(f"{n_edge} off-axis (|u_off| > {self.max_u_off})")
                 self.get_logger().warn(
-                    f"no pose: all {n_gated} mapped detection(s) rejected as ambiguous "
-                    f"(ratio < {self.min_pose_ratio}). Session: {self.gate_summary()}",
+                    f"no pose: all {n_gated + n_edge} mapped detection(s) rejected -- "
+                    f"{', '.join(why)}. Session: {self.gate_summary()}",
                     throttle_duration_sec=2.0)
             return
 
@@ -587,7 +698,8 @@ class VesselLocalizer(Node):
 
             self.get_logger().info(
                 f"FUSION: {len(estimates)} tags visible"
-                + (f", {n_gated} gated" if n_gated else "")
+                + (f", {n_gated} ambiguous" if n_gated else "")
+                + (f", {n_edge} off-axis" if n_edge else "")
                 + f"  [{self.gate_summary()}]\n" + "\n".join(lines),
                 throttle_duration_sec=1.0)
             

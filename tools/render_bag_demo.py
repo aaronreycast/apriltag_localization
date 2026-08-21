@@ -95,10 +95,18 @@ ln = load_localizer_node()
 
 
 def load_calibration(path):
+    """Returns (K, D, declared_size). declared_size is the (w, h) the yaml says it is for.
+
+    The size is returned so main() can check it against the bag's actual images. Passing
+    the wrong --calib is the single most damaging mistake available here and it is
+    SILENT: solving 640x480 images with 1080p intrinsics puts the principal point
+    outside the image, and the renderer happily produces a plausible video in which
+    every distance is wrong. Nothing crashes. One comparison turns that into an error.
+    """
     d = yaml.safe_load(open(path))
     K = np.array(d['camera_matrix']['data'], np.float64).reshape(3, 3)
     D = np.array(d['distortion_coefficients']['data'], np.float64)
-    return K, D
+    return K, D, (int(d['image_width']), int(d['image_height']))
 
 
 def load_tag_map(path):
@@ -109,7 +117,7 @@ def load_tag_map(path):
             for i, e in d['tags'].items()}
 
 
-def solve_frame(dets, tag_map, K, D, T_B_C, min_pose_ratio):
+def solve_frame(dets, tag_map, K, D, T_B_C, min_pose_ratio, max_u_off, img_w):
     """`VesselLocalizer.on_tags`: per-tag chain, ambiguity gate, then the node's fusion.
 
     Both non-trivial stages -- the PnP solve and the fusion -- are delegated to
@@ -126,14 +134,25 @@ def solve_frame(dets, tag_map, K, D, T_B_C, min_pose_ratio):
     plausible. The rule this file now follows: it may reproduce the node's plumbing
     (which detections to consider, what to draw), never its mathematics.
 
-    The gate is the reason the old local solvePnP had to go: solvePnP returns one
-    solution with no signal about the other, so there was no ratio to threshold on.
+    The ambiguity gate is the reason the old local solvePnP had to go: solvePnP returns
+    one solution with no signal about the other, so there was no ratio to threshold on.
+
+    BOTH of the node's gates are applied, in the node's order (off-axis, then ambiguity),
+    and n_gated is their combined count -- the video only needs to know a detection was
+    dropped, not which rule dropped it. The node's own logs break the two apart, because
+    there an operator has to act on the difference.
     """
     node = SimpleNamespace(tag_map=tag_map, K=K, D=D, T_B_C=T_B_C)
     ests, ids, ranges = [], [], {}
     n_gated = 0
     for tag_id, corners, margin in dets:
         if tag_id not in tag_map or margin < 30.0:
+            continue
+        # Off-axis gate, before the solve -- same order as on_tags, so the same
+        # detections are rejected for the same reason and no PnP is wasted on them.
+        u = np.mean([c.x for c in corners])
+        if abs(u - K[0, 2]) / (img_w / 2) > max_u_off:
+            n_gated += 1
             continue
         # det stand-in: tag_pose_in_camera reads only .id and .corners off the message.
         det = SimpleNamespace(id=tag_id, corners=corners)
@@ -224,7 +243,26 @@ def draw_map(canvas, tag_map, recent, cloud, pose, live_ids, tank_l, tank_w):
         cv2.polylines(canvas, [tri], True, (255, 255, 255), 1, cv2.LINE_AA)
 
 
-def draw_insets(panel, img_full, dets, img_w):
+def panel_fit(img_w, img_h):
+    """Scale + offset mapping full-image pixel coords into the camera panel.
+
+    ONE definition, used for the image AND for every overlay drawn on it. It used to be
+    the bare ratio CAM_W/img_w applied uniformly, which is only correct when the image
+    aspect matches the panel's. Every resolution this project used was 16:9, so it was
+    right by luck until a 4:3 480p bag was rendered on 2026-08-13: overlays landed
+    81 px too LOW -- directly under each wall tag, in the water -- and read convincingly
+    as the detector having locked onto tag reflections. It had not; the detections were
+    correct and only the drawing was wrong.
+
+    Letterboxes rather than stretching, so a 4:3 source keeps its geometry instead of
+    being smeared into 16:9. Returns (scale, x_offset, y_offset); for a 16:9 source the
+    offsets are 0 and behaviour is identical to before.
+    """
+    s = min(CAM_W / img_w, CAM_H / img_h)
+    return s, int((CAM_W - img_w * s) / 2), int((CAM_H - img_h * s) / 2)
+
+
+def draw_insets(panel, img_full, dets, fit):
     """Zoomed crops of each detected tag. Tags are ~15-55 px in a 1080p tank frame -- without
     this they are invisible in the rendered video."""
     n = min(len(dets), 4)
@@ -251,7 +289,8 @@ def draw_insets(panel, img_full, dets, img_w):
         cv2.rectangle(panel, (x, y), (x + size, y + size), c, 2)
         cv2.rectangle(panel, (x, y - 18), (x + size, y), c, -1)
         txt(panel, f'tag {tag_id}   {rng:.2f} m', (x + 8, y - 5), 0.4, (20, 20, 20))
-        px, py = (pts_full.mean(0) * (CAM_W / img_w)).astype(int)
+        s, ox, oy = fit
+        px, py = (pts_full.mean(0) * s + [ox, oy]).astype(int)
         cv2.line(panel, (px, py + 12), (x + size // 2, y - 20), c, 1, cv2.LINE_AA)
         x += size + gap
 
@@ -305,13 +344,17 @@ def main():
                    help='Open Item #8 ambiguity gate; 0.0 disables it. Defaults to the '
                         "node's own default, imported -- do not hard-code it here. "
                         'Pass 0.0 to render pre-gate behaviour for a before/after.')
+    p.add_argument('--max-u-off', type=float, default=ln.DEFAULT_MAX_U_OFF,
+                   help='off-axis gate: max |u-cx|/(width/2) for a detection to be used. '
+                        "Defaults to the node's own default, imported -- do not hard-code "
+                        'it here. Pass 2.0 to disable.')
     p.add_argument('--tank', default='14.0,5.0', help='drawn tank extent "length,width" (m)')
     p.add_argument('--title', default='apriltag_localization  -  vessel_localizer')
     p.add_argument('--subtitle', default='')
     args = p.parse_args()
 
     tank_l, tank_w = (float(v) for v in args.tank.split(','))
-    K, D = load_calibration(args.calib)
+    K, D, calib_size = load_calibration(args.calib)
     tag_map = load_tag_map(args.map)
     T_B_C = camera_mount()
     mount = T_B_C[:3, 3]
@@ -344,9 +387,26 @@ def main():
         full = np.frombuffer(m.data, np.uint8).reshape(m.height, m.width, 3)
         if m.encoding == 'rgb8':
             full = cv2.cvtColor(full, cv2.COLOR_RGB2BGR)
-        panel = cv2.resize(full, (CAM_W, CAM_H), interpolation=cv2.INTER_AREA)
+        # Letterbox into the panel: a 4:3 source keeps its aspect instead of being
+        # stretched into the 16:9 panel. fit is reused for every overlay below, so the
+        # drawing cannot disagree with the image it is drawn on.
+        fit = panel_fit(m.width, m.height)
+        _s, _ox, _oy = fit
+        panel = np.full((CAM_H, CAM_W, 3), BG, np.uint8)
+        _rs = cv2.resize(full, (int(m.width * _s), int(m.height * _s)),
+                         interpolation=cv2.INTER_AREA)
+        panel[_oy:_oy + _rs.shape[0], _ox:_ox + _rs.shape[1]] = _rs
 
-        res, n_gated = (solve_frame(tags[stamp], tag_map, K, D, T_B_C, args.min_pose_ratio)
+        # One-time guard: the calibration must be FOR these images. Wrong --calib is
+        # silent and ruinous -- see load_calibration().
+        if n_frame == 1 and (m.width, m.height) != calib_size:
+            raise SystemExit(
+                f'--calib is for {calib_size[0]}x{calib_size[1]} but the bag has '
+                f'{m.width}x{m.height} images. Use config/camera_'
+                f'{ {640:"480p",1280:"720p",1920:"1080p"}.get(m.width,"<res>") }.yaml')
+
+        res, n_gated = (solve_frame(tags[stamp], tag_map, K, D, T_B_C,
+                                    args.min_pose_ratio, args.max_u_off, m.width)
                         if stamp in tags else (None, 0))
         n_gated_total += n_gated
         dets = []
@@ -357,14 +417,14 @@ def main():
                     continue
                 pts = np.array([[c.x, c.y] for c in corners], np.float64)
                 dets.append((tag_id, pts, res['ranges'][tag_id]))
-                q = (pts * (CAM_W / m.width)).astype(np.int32)
+                q = (pts * _s + [_ox, _oy]).astype(np.int32)
                 cv2.polylines(panel, [q], True, col(tag_id), 2, cv2.LINE_AA)
                 cv2.circle(panel, tuple(q.mean(0).astype(int)), 16, col(tag_id), 1, cv2.LINE_AA)
             last = (res['t'][0], res['t'][1], res['yaw'])
             cloud.append(last[:2])
             recent = (recent + [last[:2]])[-40:]
 
-        draw_insets(panel, full, sorted(dets, key=lambda d: d[1][:, 0].mean()), m.width)
+        draw_insets(panel, full, sorted(dets, key=lambda d: d[1][:, 0].mean()), fit)
 
         canvas = np.full((H, W, 3), BG, np.uint8)
         canvas[CAM_Y:CAM_Y + CAM_H, CAM_X:CAM_X + CAM_W] = panel
@@ -399,8 +459,13 @@ def main():
                 txt(canvas, f'last fix  x {last[0]:+6.2f} m   y {last[1]:+6.2f} m   '
                             f'yaw {math.degrees(last[2]):+7.1f} deg',
                     (CAM_X, hy + 28), 0.56, DIM)
-        gate_note = (f'ambiguity gate {args.min_pose_ratio:.1f}, {n_gated_total} rejected'
-                     if args.min_pose_ratio > 0 else 'ambiguity gate OFF')
+        gates = []
+        if args.min_pose_ratio > 0:
+            gates.append(f'ambiguity {args.min_pose_ratio:.2f}')
+        if args.max_u_off <= 1.0:
+            gates.append(f'off-axis {args.max_u_off:.2f}')
+        gate_note = (f"gates: {' + '.join(gates)}, {n_gated_total} rejected"
+                     if gates else 'gates OFF')
         txt(canvas, f'frames with a fix, this excerpt: {100 * n_fix / max(1, n_frame):4.1f} %   '
                     f'(raw per-frame output, no smoothing; {gate_note})',
             (CAM_X, hy + 54), 0.42, DIM)
@@ -420,7 +485,8 @@ def main():
     ff.wait()
     print(f'{n_frame} frames, {n_fix} with a fix '
           f'({100 * n_fix / max(1, n_frame):.1f}%), '
-          f'{n_gated_total} detections gated at min_pose_ratio={args.min_pose_ratio} '
+          f'{n_gated_total} detections gated '
+          f'(min_pose_ratio={args.min_pose_ratio}, max_u_off={args.max_u_off}) '
           f'-> {args.out}')
 
 
