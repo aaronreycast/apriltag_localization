@@ -253,6 +253,37 @@ ros2 topic hz  /vessel_pose     # the pose rate; /tags is NOT it
 When two or more mapped tags are visible, the node also logs each tag's independent estimate
 and the fused result (throttled to 1 Hz) for validation.
 
+## Testing, CI and Docker
+
+**Unit tests.** `test/test_geometry.py` holds six pytest tests of the pose maths that does not
+need ROS running: matrix-to-quaternion round trips (including a 180 degree case), rigid
+transform inversion, and quaternion averaging (a single-quaternion case and the empty-input
+case). The node callbacks themselves are not unit tested. Run them with:
+
+```bash
+cd ~/Workspaces/apriltag_ws
+colcon test --packages-select apriltag_localization \
+  --pytest-args -k "not flake8 and not pep257 and not copyright"
+colcon test-result --verbose
+```
+
+**CI.** A GitHub Actions workflow (`.github/workflows/ci.yml`) runs on every push and pull
+request. It starts a `ros:jazzy` container, installs dependencies with `rosdep`, builds with
+`colcon build` and runs the tests above. The three ament lint checks (flake8, pep257,
+copyright) currently fail on existing code and are excluded from CI; they are not claimed as
+passing.
+
+**Docker.** The `Dockerfile` is based on `ros:jazzy`, installs dependencies with `rosdep` and
+builds the package. To build it and run the tests inside the container:
+
+```bash
+docker build -t apriltag-localization .
+docker run --rm apriltag-localization bash -c ". /ws/install/setup.bash && \
+  colcon test --packages-select apriltag_localization \
+  --pytest-args -k 'not flake8 and not pep257 and not copyright' && \
+  colcon test-result --verbose"
+```
+
 ## Status
 
 The node is validated end-to-end on hardware — single tag and multi-tag fusion — at the
