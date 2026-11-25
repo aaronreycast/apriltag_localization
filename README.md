@@ -1,3 +1,5 @@
+[![CI](https://github.com/aaronreycast/apriltag_localization/actions/workflows/ci.yml/badge.svg)](https://github.com/aaronreycast/apriltag_localization/actions/workflows/ci.yml)
+
 # apriltag_localization
 
 Full 6-DoF pose estimation of a surface vessel (ASV) inside a tank, from AprilTags mounted on
