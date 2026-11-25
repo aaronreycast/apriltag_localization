@@ -1,0 +1,28 @@
+name: CI
+on: [push, pull_request]
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    container: ros:jazzy
+    defaults:
+      run:
+        shell: bash              
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: ws/src/apriltag_localization
+      - name: Install dependencies
+        run: |
+          apt-get update
+          rosdep update
+          rosdep install --from-paths ws/src --ignore-src -y
+      - name: Build
+        run: |
+          source /opt/ros/jazzy/setup.bash
+          cd ws && colcon build
+      - name: Test
+        run: |
+          source /opt/ros/jazzy/setup.bash
+          cd ws
+          colcon test --packages-select apriltag_localization --pytest-args -k "not flake8 and not pep257 and not copyright"
+          colcon test-result --verbose
